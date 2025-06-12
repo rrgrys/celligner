@@ -15,9 +15,12 @@ import gc
 
 import pandas as pd
 import numpy as np
+from collections import defaultdict
 
 #from contrastive import CPCA
 from mnnpy import mnn
+
+import matplotlib.pyplot as plt
 
 class Celligner(object):
     def __init__(
@@ -193,8 +196,8 @@ class Celligner(object):
             .topTable(number=len(data)) 
             .iloc[:, len(clusts) :]
         )
-        return res.sort_values(by="F", ascending=False)
-    
+        return res.sort_values(by="F", ascending=False)    
+
 
     def __runCPCA(self, centered_ref_input, centered_target_input):
         """
@@ -209,46 +212,22 @@ class Celligner(object):
             (ndarray, ncomponents,): variance explained by each component
 
         """
-        target_cov = centered_target_input.cov()
-        ref_cov = centered_ref_input.cov()
+        # take half of the samples from the ref dataset as background (randomly)
+        n_samples = np.floor(centered_ref_input.shape[0] / 2)
+        background = centered_ref_input.sample(n=int(n_samples), random_state=42)
+        # take the other half as target
+        other_ref_samples = centered_ref_input.drop(background.index)
+        foreground = pd.concat([other_ref_samples, centered_target_input])
+        background_cov = background.cov()
+        foreground_cov = foreground.cov()
         if not self.low_mem:
             pca = PCA(self.cpca_ncomp, svd_solver="randomized", copy=False)
         else: 
             pca = IncrementalPCA(self.cpca_ncomp, copy=False, batch_size=1000)
         
-        pca.fit(target_cov - ref_cov)
+        pca.fit(foreground_cov - background_cov)
         return pca.components_, pca.explained_variance_
-    
-    def __apply_cpca_shift(self, X_ref, X_target, cpca_loadings):
-        """
-        Align target samples to reference by shifting their cPC projections to match the reference centroid.
 
-        Args:
-            X_ref (pd.DataFrame): Reference expression (samples × genes)
-            X_target (pd.DataFrame): Target expression (samples × genes)
-            cpca_loadings (np.ndarray): cPCA loadings (n_cpcs × n_genes)
-
-        Returns:
-            pd.DataFrame: Shift-corrected target expression (same shape as X_target)
-        """
-        assert list(X_ref.columns) == list(X_target.columns), "Mismatched gene order"
-        assert cpca_loadings.shape[1] == X_target.shape[1], "cPCA loadings and input gene dims must match"
-
-        # Projection into cPC space
-        Z_ref = cpca_loadings @ X_ref.T.values
-        Z_target = cpca_loadings @ X_target.T.values
-
-        # Compute shift
-        delta = Z_ref.mean(axis=1).reshape(-1, 1) - Z_target.mean(axis=1).reshape(-1, 1)
-
-        # Apply shift
-        Z_target_shifted = Z_target + delta
-
-        # Back-project
-        X_target_corrected = (cpca_loadings.T @ Z_target_shifted).T
-
-        # Rewrap into DataFrame
-        return pd.DataFrame(X_target_corrected, index=X_target.index, columns=X_target.columns)
 
     def fit(self, ref_expr):
         """
@@ -275,23 +254,14 @@ class Celligner(object):
         return self
 
 
-    def transform(self, target_expr=None, compute_cPCs=True):
+    def transform(self, target_expr=None, compute_cPCs=True, recompute_MNN=True):
         """
-        Align samples in the target dataset to samples in the reference dataset
-
-        Args:
-            target_expr (pd.Dataframe, optional): target expression matrix of samples (rows) by genes (columns), 
-                where genes are ensembl gene IDs. Data should be log2(X+1) TPM data.
-            compute_cPCs (bool, optional): if True, compute cPCs from the fitted reference and target expression. Defaults to True.
-
-        Raises:
-            ValueError: if compute_cPCs is True but there is no reference input (fit has not been run)
-            ValueError: if compute_cPCs is False but there are no previously computed cPCs available (transform has not been previously run)
-            ValueError: if no target expression is provided and there is no previously provided target data
-            ValueError: if no target expression is provided and compute_cPCs is true; there is no use case for this
-            ValueError: if there are not enough clusters to compute DE genes for the target dataset
+        Align samples in the target dataset to samples in the reference dataset.
         """
 
+        print("⚙️ Starting transformation")
+        
+        # --- VALIDATION BLOCK ---
         if self.ref_input is None and compute_cPCs:
             raise ValueError("Need fitted reference dataset to compute cPCs, run fit function first")
 
@@ -304,121 +274,202 @@ class Celligner(object):
         if not compute_cPCs and target_expr is None:
             raise ValueError("No use case for running transform without new target data when compute_cPCs==True")
 
+        # --- TARGET PROCESSING & CLUSTERING ---
         if compute_cPCs:
-
             if target_expr is not None:
-
                 self.target_input = self.__checkExpression(target_expr, is_reference=False)
                 self.centered_target_input = self.__meanCenter()
 
-                # Cluster and find differential expression for target data
+                print(f"✅ Target input shape: {self.target_input.shape}")
+                print(f"📉 Target input min: {self.target_input.min().min():.3f}, max: {self.target_input.max().max():.3f}")
+
                 self.target_clusters = self.__cluster(self.centered_target_input)
+                print(f"🔍 Found {len(set(self.target_clusters))} clusters in target")
+
                 if len(set(self.target_clusters)) < 2:
                     raise ValueError("Only one cluster found in target data, no DE possible")
+
                 self.target_de_genes = self.__runDiffExprOnClusters(self.centered_target_input, self.target_clusters)
 
-                self.de_genes = pd.Series(list(self.ref_de_genes[:self.topKGenes].index) +
-                                          list(self.target_de_genes[:self.topKGenes].index)).drop_duplicates().tolist()
+                self.de_genes = pd.Series(
+                    list(self.ref_de_genes[:self.topKGenes].index) +
+                    list(self.target_de_genes[:self.topKGenes].index)
+                ).drop_duplicates().tolist()
+                print(f"🧬 {len(self.de_genes)} DE genes selected")
 
             else:
                 print("INFO: No new target expression provided, using previously provided target dataset")
 
-            # Subtract cluster average from cluster samples
-            cluster_centered_ref = pd.concat(
-                [
-                    self.ref_input.loc[self.ref_clusters == val] - self.ref_input.loc[self.ref_clusters == val].mean(axis=0)
-                    for val in set(self.ref_clusters)
-                ]
-            ).loc[self.ref_input.index]
-            
-            cluster_centered_target = pd.concat(
-                [
-                    self.target_input.loc[self.target_clusters == val] - self.target_input.loc[self.target_clusters == val].mean(axis=0)
-                    for val in set(self.target_clusters)
-                ]
-            ).loc[self.target_input.index]
+            # --- CLUSTER CENTERING ---
+            cluster_centered_ref = pd.concat([
+                self.ref_input.loc[self.ref_clusters == val] - self.ref_input.loc[self.ref_clusters == val].mean(axis=0)
+                for val in set(self.ref_clusters)
+            ]).loc[self.ref_input.index]
 
-            print("Running cPCA...")
+            cluster_centered_target = pd.concat([
+                self.target_input.loc[self.target_clusters == val] - self.target_input.loc[self.target_clusters == val].mean(axis=0)
+                for val in set(self.target_clusters)
+            ]).loc[self.target_input.index]
+
+            print("🚀 Running cPCA...")
             self.cpca_loadings, self.cpca_explained_var = self.__runCPCA(cluster_centered_ref, cluster_centered_target)
-
+            print(f"✅ cPC shape: {self.cpca_loadings.shape}")
             del cluster_centered_ref, cluster_centered_target
             gc.collect()
 
         else:
+            print("📦 Handling new target expression with precomputed cPCs")
             missing_genes = list(self.ref_input.loc[:, ~self.ref_input.columns.isin(target_expr.columns)].columns)
-            if len(missing_genes) > 0:
-                print('WARNING: %d genes from reference dataset not found in new target dataset, subsetting to overlap' % (len(missing_genes)))
+            if missing_genes:
+                print(f"⚠️ {len(missing_genes)} missing genes from reference in target, dropping")
+
                 drop_idx = [self.ref_input.columns.get_loc(g) for g in missing_genes]
                 self.ref_input = self.ref_input.loc[:, self.ref_input.columns.isin(target_expr.columns)]
                 self.common_genes = list(self.ref_input.columns)
                 self.cpca_loadings = np.array([np.delete(self.cpca_loadings[n], drop_idx) for n in range(self.cpca_ncomp)])
+
                 overlap = self.ref_input.loc[:, self.ref_input.columns.isin(self.de_genes)]
                 if overlap.shape[1] < len(self.de_genes):
-                    print('WARNING: dropped genes include %d differentially expressed genes that may be important' % (len(self.de_genes) - overlap.shape[1]))
-                    temp = pd.Series(self.de_genes)
-                    self.de_genes = temp[temp.isin(self.ref_input.columns)].to_list()
+                    print(f"⚠️ Dropped {len(self.de_genes) - overlap.shape[1]} DE genes")
+
+                self.de_genes = pd.Series(self.de_genes)[pd.Series(self.de_genes).isin(self.ref_input.columns)].to_list()
 
             self.target_input = self.__checkExpression(target_expr, is_reference=False)
             self.centered_target_input = self.__meanCenter()
+            transformed_ref = self.ref_input
 
-        # print("Computing cPC shift for target alignment...")
-        # X_ref = self.ref_input
-        # X_target = self.centered_target_input
+        # --- REGRESSION OF cPCs ---
+        print("🧮 Regressing top cPCs from reference...")
+        regression_ref = LinearRegression(fit_intercept=False) \
+            .fit(self.cpca_loadings.T, self.ref_input.T) \
+            .predict(self.cpca_loadings.T).T
+        regression_ref = pd.DataFrame(regression_ref, index=self.ref_input.index, columns=self.ref_input.columns)
+        transformed_ref = self.ref_input - regression_ref
 
-        # print(f"dimension of X_target: {X_target.shape}, dimension of X_ref: {X_ref.shape}")
+        print("🧮 Regressing top cPCs from target...")
+        regression_target = LinearRegression(fit_intercept=False) \
+            .fit(self.cpca_loadings.T, self.target_input.T) \
+            .predict(self.cpca_loadings.T).T
+        transformed_target = self.target_input - regression_target
 
-        # print(f"shape of cpca_loadings: {self.cpca_loadings.shape}, n_components: {self.cpca_ncomp}, n_genes: {self.cpca_loadings.shape[1]}")
+        print(f"🔍 Check regression result stats:")
+        print(f" - ref residuals max: {regression_ref.max().max():.2f}, min: {regression_ref.min().min():.2f}")
+        print(f" - target residuals max: {regression_target.max():.2f}, min: {regression_target.min():.2f}")
+        print(f" - transformed target max: {transformed_target.max().max():.2f}, min: {transformed_target.min().min():.2f}")
 
-        # Step 2: Fit regressions
-        # reg_target = LinearRegression(fit_intercept=False).fit(self.cpca_loadings.T, X_target.T)
-        # reg_ref = LinearRegression(fit_intercept=False).fit(self.cpca_loadings.T, X_ref.T)
-
-        # # Step 3: Predict component signals
-        # fitted_target = reg_target.predict(self.cpca_loadings.T).T
-        # fitted_ref = reg_ref.predict(self.cpca_loadings.T).mean(axis=1, keepdims=True)
-
-        # # check shapes
-        # print(f"fitted_target shape: {fitted_target.shape}, fitted_ref shape: {fitted_ref.shape}")
-
-        # fitted_ref_df = pd.DataFrame(
-        #     np.repeat(fitted_ref.T, repeats=X_target.shape[0], axis=0),
-        #     index=X_target.index,
-        #     columns=X_target.columns
-        # )
-        # print(f"fitted_ref_df shape: {fitted_ref_df.shape}")
-
-        # # Step 4: Subtract target's signal and add back ref's average signal
-        # X_target_corrected = X_target - fitted_target + fitted_ref_df
-        # display(X_target_corrected)
-
-        X_target_corrected = self.__apply_cpca_shift(self.ref_input, self.centered_target_input, self.cpca_loadings)
-        print("Corrected target expression matrix:")
-        display(X_target_corrected)
-        print('input ref expression matrix:')
-        display(self.ref_input)
-
-        print("Doing the MNN analysis using Marioni et al. method...")
-        varsubset = np.array([1 if i in self.de_genes else 0 for i in self.centered_target_input.columns]).astype(bool)
-        print(self.ref_input.shape, X_target_corrected.shape, varsubset.sum(), self.mnn_kwargs)
-        print("ref_input shape:", self.ref_input.shape)
-        print("X_target_corrected shape:", X_target_corrected.shape)
-        print("varsubset shape:", varsubset.shape)
-        print("var_index:", len(list(range(len(self.ref_input.columns)))))
-        assert (self.ref_input.columns == X_target_corrected.columns).all(), "Reference and target expression matrices do not have the same genes"
+        # --- MNN ANALYSIS ---
+        print("🔗 Running MNN correction on regressed data...")
+        varsubset = np.array([1 if g in self.de_genes else 0 for g in self.centered_target_input.columns]).astype(bool)
         target_corrected, self.mnn_pairs = mnn.marioniCorrect(
-            self.ref_input,
-            X_target_corrected,
+            transformed_ref,
+            transformed_target,
             var_index=list(range(len(self.ref_input.columns))),
             var_subset=varsubset,
             **self.mnn_kwargs,
         )
+        print(f"✅ Got {len(self.mnn_pairs)} MNN pairs")
+
+        # --- RESIDUAL ADD-BACK ---
+        print("➕ Adding back residuals based on MNN pairs")
+        ref_index = self.ref_input.index.to_numpy()
+        target_index = self.target_input.index.to_numpy()
+
+        mnn_dict = defaultdict(list)
+        for ref_pos, target_pos in self.mnn_pairs:
+            mnn_dict[target_pos].append(ref_pos)
+
+        residual_addback = pd.DataFrame(0, index=target_index, columns=transformed_target.columns)
+
+        for t_pos, r_pos_list in mnn_dict.items():
+            if not r_pos_list:
+                continue
+            t_idx = target_index[t_pos]
+            r_indices = ref_index[r_pos_list]
+
+            # Validate alignment
+            if not all(regression_ref.columns == residual_addback.columns):
+                raise ValueError("Column mismatch in residual addback!")
+
+            avg_residual = regression_ref.loc[r_indices].mean(axis=0)
+            residual_addback.loc[t_idx] = avg_residual.values
+
+        addback_norms = residual_addback.apply(np.linalg.norm, axis=1)
+
+        plt.figure(figsize=(6,4))
+        addback_norms.hist(bins=30)
+        plt.title("L2 norm of residual add-back vectors")
+        plt.xlabel("L2 norm")
+        plt.ylabel("# of samples")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+        angles = []
+
+        for idx in residual_addback.index:
+            v1 = transformed_target.loc[idx].values
+            v2 = residual_addback.loc[idx].values
+
+            # Normalize vectors
+            norm1 = np.linalg.norm(v1)
+            norm2 = np.linalg.norm(v2)
+
+            # Skip if any vector is zero
+            if norm1 == 0 or norm2 == 0:
+                continue
+
+            cos_sim = np.dot(v1, v2) / (norm1 * norm2)
+            # Clip to avoid numerical errors
+            cos_sim = np.clip(cos_sim, -1.0, 1.0)
+            angle = np.arccos(cos_sim) * 180 / np.pi  # Convert to degrees
+
+            angles.append(angle)
+
+        # Plot histogram
+        plt.figure(figsize=(6, 4))
+        plt.hist(angles, bins=30)
+        plt.title("Angle Between Transformed Target and Add-back Vectors")
+        plt.xlabel("Angle (degrees)")
+        plt.ylabel("Number of Samples")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+        print(f"✅ Residual addback stats — max: {residual_addback.max().max():.2f}, min: {residual_addback.min().min():.2f}")
+        double_transformed_target = transformed_target + residual_addback
+        print(f"📈 Post-addback target max: {double_transformed_target.max().max():.2f}, min: {double_transformed_target.min().min():.2f}")
+        print(f"🧼 Any NaNs in final matrix? {double_transformed_target.isna().any().any()}")
+
+        # --- FINAL WARPING ---
+        if recompute_MNN:
+            print("🔁 Re-running MNN warp using new MNN pairs...")
+            target_corrected, self.mnn_pairs = mnn.marioniCorrect(
+                self.ref_input,
+                double_transformed_target,
+                var_index=list(range(len(self.ref_input.columns))),
+                var_subset=varsubset,
+                **self.mnn_kwargs,
+            )
+            print(f"✅ Got {len(self.mnn_pairs)} MNN pairs")
+        else:
+            print("🔁 Re-running MNN warp using established MNN pairs...")
+            target_corrected, _ = mnn.marioniCorrect(
+                self.ref_input,
+                double_transformed_target,
+                var_index=list(range(len(self.ref_input.columns))),
+                var_subset=varsubset,
+                mnn_pairs=self.mnn_pairs,
+                **self.mnn_kwargs,
+            )
 
         self.combined_output = pd.concat([self.ref_input, target_corrected])
+        print(f"✅ Final combined shape: {self.combined_output.shape}")
         del target_corrected
         gc.collect()
 
-        print('Done')
+        print("✅ Done")
         return self
+
 
     def computeMetricsForOutput(self, umap_rand_seed=14, UMAP_only=False, model_ids=None, tumor_ids=None):
         """
