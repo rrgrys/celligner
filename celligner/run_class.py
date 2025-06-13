@@ -27,7 +27,7 @@ class Celligner(object):
         self,
         topKGenes=TOP_K_GENES,
         pca_ncomp=PCA_NCOMP,
-        cpca_ncomp=CPCA_NCOMP,
+        cpca_ncomp=2,
         louvain_kwargs=LOUVAIN_PARAMS,
         mnn_kwargs=MNN_PARAMS,
         umap_kwargs=UMAP_PARAMS,
@@ -254,11 +254,7 @@ class Celligner(object):
         return self
 
 
-    def transform(self, target_expr=None, compute_cPCs=True, recompute_MNN=True):
-        """
-        Align samples in the target dataset to samples in the reference dataset.
-        """
-
+    def transform(self, target_expr=None, compute_cPCs=True):
         print("⚙️ Starting transformation")
         
         # --- VALIDATION BLOCK ---
@@ -290,7 +286,6 @@ class Celligner(object):
                     raise ValueError("Only one cluster found in target data, no DE possible")
 
                 self.target_de_genes = self.__runDiffExprOnClusters(self.centered_target_input, self.target_clusters)
-
                 self.de_genes = pd.Series(
                     list(self.ref_de_genes[:self.topKGenes].index) +
                     list(self.target_de_genes[:self.topKGenes].index)
@@ -322,7 +317,6 @@ class Celligner(object):
             missing_genes = list(self.ref_input.loc[:, ~self.ref_input.columns.isin(target_expr.columns)].columns)
             if missing_genes:
                 print(f"⚠️ {len(missing_genes)} missing genes from reference in target, dropping")
-
                 drop_idx = [self.ref_input.columns.get_loc(g) for g in missing_genes]
                 self.ref_input = self.ref_input.loc[:, self.ref_input.columns.isin(target_expr.columns)]
                 self.common_genes = list(self.ref_input.columns)
@@ -336,7 +330,6 @@ class Celligner(object):
 
             self.target_input = self.__checkExpression(target_expr, is_reference=False)
             self.centered_target_input = self.__meanCenter()
-            transformed_ref = self.ref_input
 
         # --- REGRESSION OF cPCs ---
         print("🧮 Regressing top cPCs from reference...")
@@ -357,10 +350,10 @@ class Celligner(object):
         print(f" - target residuals max: {regression_target.max():.2f}, min: {regression_target.min():.2f}")
         print(f" - transformed target max: {transformed_target.max().max():.2f}, min: {transformed_target.min().min():.2f}")
 
-        # --- MNN ANALYSIS ---
-        print("🔗 Running MNN correction on regressed data...")
+        # --- MNN ANALYSIS IN REGRESSED SPACE ---
+        print("🔗 Running MNN correction in regressed-out space...")
         varsubset = np.array([1 if g in self.de_genes else 0 for g in self.centered_target_input.columns]).astype(bool)
-        target_corrected, self.mnn_pairs = mnn.marioniCorrect(
+        _, self.mnn_pairs = mnn.marioniCorrect(
             transformed_ref,
             transformed_target,
             var_index=list(range(len(self.ref_input.columns))),
@@ -369,98 +362,26 @@ class Celligner(object):
         )
         print(f"✅ Got {len(self.mnn_pairs)} MNN pairs")
 
-        # --- RESIDUAL ADD-BACK ---
-        print("➕ Adding back residuals based on MNN pairs")
-        ref_index = self.ref_input.index.to_numpy()
-        target_index = self.target_input.index.to_numpy()
+        # --- FINAL ALIGNMENT: Warp target toward unmodified reference ---
+        print("🔁 Applying warp from transformed target to original reference using MNN pairs...")
+        target_corrected, _ = mnn.marioniCorrect(
+            self.ref_input,
+            transformed_target,
+            var_index=list(range(len(self.ref_input.columns))),
+            var_subset=varsubset,
+            mnn_pairs=self.mnn_pairs,
+            **self.mnn_kwargs,
+        )
 
-        mnn_dict = defaultdict(list)
-        for ref_pos, target_pos in self.mnn_pairs:
-            mnn_dict[target_pos].append(ref_pos)
+        # Step 1: Compute centroid of transformed_target
+        centroid = transformed_target.mean(axis=0)
 
-        residual_addback = pd.DataFrame(0, index=target_index, columns=transformed_target.columns)
+        # Step 2: Center transformed_target around that centroid
+        centered_residual = transformed_target - centroid
 
-        for t_pos, r_pos_list in mnn_dict.items():
-            if not r_pos_list:
-                continue
-            t_idx = target_index[t_pos]
-            r_indices = ref_index[r_pos_list]
-
-            # Validate alignment
-            if not all(regression_ref.columns == residual_addback.columns):
-                raise ValueError("Column mismatch in residual addback!")
-
-            avg_residual = regression_ref.loc[r_indices].mean(axis=0)
-            residual_addback.loc[t_idx] = avg_residual.values
-
-        addback_norms = residual_addback.apply(np.linalg.norm, axis=1)
-
-        plt.figure(figsize=(6,4))
-        addback_norms.hist(bins=30)
-        plt.title("L2 norm of residual add-back vectors")
-        plt.xlabel("L2 norm")
-        plt.ylabel("# of samples")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-
-        angles = []
-
-        for idx in residual_addback.index:
-            v1 = transformed_target.loc[idx].values
-            v2 = residual_addback.loc[idx].values
-
-            # Normalize vectors
-            norm1 = np.linalg.norm(v1)
-            norm2 = np.linalg.norm(v2)
-
-            # Skip if any vector is zero
-            if norm1 == 0 or norm2 == 0:
-                continue
-
-            cos_sim = np.dot(v1, v2) / (norm1 * norm2)
-            # Clip to avoid numerical errors
-            cos_sim = np.clip(cos_sim, -1.0, 1.0)
-            angle = np.arccos(cos_sim) * 180 / np.pi  # Convert to degrees
-
-            angles.append(angle)
-
-        # Plot histogram
-        plt.figure(figsize=(6, 4))
-        plt.hist(angles, bins=30)
-        plt.title("Angle Between Transformed Target and Add-back Vectors")
-        plt.xlabel("Angle (degrees)")
-        plt.ylabel("Number of Samples")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-
-        print(f"✅ Residual addback stats — max: {residual_addback.max().max():.2f}, min: {residual_addback.min().min():.2f}")
-        double_transformed_target = transformed_target + residual_addback
-        print(f"📈 Post-addback target max: {double_transformed_target.max().max():.2f}, min: {double_transformed_target.min().min():.2f}")
-        print(f"🧼 Any NaNs in final matrix? {double_transformed_target.isna().any().any()}")
-
-        # --- FINAL WARPING ---
-        if recompute_MNN:
-            print("🔁 Re-running MNN warp using new MNN pairs...")
-            target_corrected, self.mnn_pairs = mnn.marioniCorrect(
-                self.ref_input,
-                double_transformed_target,
-                var_index=list(range(len(self.ref_input.columns))),
-                var_subset=varsubset,
-                **self.mnn_kwargs,
-            )
-            print(f"✅ Got {len(self.mnn_pairs)} MNN pairs")
-        else:
-            print("🔁 Re-running MNN warp using established MNN pairs...")
-            target_corrected, _ = mnn.marioniCorrect(
-                self.ref_input,
-                double_transformed_target,
-                var_index=list(range(len(self.ref_input.columns))),
-                var_subset=varsubset,
-                mnn_pairs=self.mnn_pairs,
-                **self.mnn_kwargs,
-            )
+        # Step 3: Add scaled centered signal back to the fully warped target
+        alpha = 0.1
+        target_corrected += alpha * centered_residual
 
         self.combined_output = pd.concat([self.ref_input, target_corrected])
         print(f"✅ Final combined shape: {self.combined_output.shape}")
