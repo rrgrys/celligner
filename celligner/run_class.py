@@ -19,6 +19,7 @@ from collections import defaultdict
 
 #from contrastive import CPCA
 from mnnpy import mnn
+from sklearn.cross_decomposition import CCA
 
 import matplotlib.pyplot as plt
 
@@ -75,6 +76,10 @@ class Celligner(object):
         self.output_clusters = None
         self.tumor_CL_dist = None
 
+        self.mnn_pairs = None
+        self.cca = None
+        self.pca_X = None
+        self.pca_Y = None
 
     def __checkExpression(self, expression, is_reference):
         """
@@ -228,7 +233,66 @@ class Celligner(object):
         pca.fit(foreground_cov - background_cov)
         return pca.components_, pca.explained_variance_
 
+    def __ReduceDim(self,counts, n_components=2, pca = None):
+        """
+        Reduce dimensionality of the counts using PCA.
+        Args:
+            counts (pd.DataFrame): DataFrame with samples as columns and genes as rows.
+            n_components (int): Number of components to keep.
+        Returns:
+            pd.DataFrame: Reduced dimensionality DataFrame.
+        """
+        if pca is None:
+            pca = PCA(n_components=n_components)
+        print(f"Original shape: {counts.shape}")
+        reduced_counts = pca.fit_transform(counts)
+        print(f"Reduced shape: {reduced_counts.shape}")
+        return pd.DataFrame(reduced_counts, index=counts.index, columns=[f'PC{i+1}' for i in range(n_components)]), pca
 
+    def __fitCCA(self, X, Y, cca_components=2, pca_components=30, max_iter=1000):
+        """
+        Run Canonical Correlation Analysis (CCA) on the paired data.
+
+        Args:
+            X (pd.DataFrame): paired data matrix for the first modality (e.g., reference).
+            Y (pd.DataFrame): paired data matrix for the second modality (e.g., target).
+            cca_components (int): Number of components to extract from CCA.
+            pca_components (int): Number of components to use from PCA.
+
+        Returns:
+            tuple: CCA components and explained variance.
+        """
+
+        self.cca = CCA(n_components=cca_components, max_iter=max_iter)
+
+        # run PCA on both datasets to reduce dimensionality
+        X_reduced, self.pca_X = self.__ReduceDim(X, n_components=pca_components)
+        Y_reduced, self.pca_Y = self.__ReduceDim(Y, n_components=pca_components)
+        self.cca.fit(X_reduced, Y_reduced)
+
+    def __CCAtransform(self, X, Y):
+        """
+        Transform the data using the fitted CCA model.
+
+        Args:
+            X (pd.DataFrame): Data matrix for the first modality (e.g., reference).
+            Y (pd.DataFrame): Data matrix for the second modality (e.g., target).
+
+        Returns:
+            tuple: Transformed data matrices for both modalities.
+        """
+
+        if self.cca is None:
+            raise ValueError("CCA model is not fitted. Please fit the model first using __fitCCA method.")
+        
+        # reduce dimensionality of the input data
+        X_reduced, _ = self.__ReduceDim(X, n_components=self.pca_X.n_components_, pca=self.pca_X)
+        self.Y_reduced, _ = self.__ReduceDim(Y, n_components=self.pca_Y.n_components_, pca=self.pca_Y)
+        
+        X_transformed, Y_transformed = self.cca.transform(X_reduced, self.Y_reduced)
+
+        return X_transformed, Y_transformed
+    
     def fit(self, ref_expr):
         """
         Fit the model to the reference expression dataset - cluster + find differentially expressed genes.
@@ -254,7 +318,7 @@ class Celligner(object):
         return self
 
 
-    def transform(self, target_expr=None, compute_cPCs=True):
+    def transform(self, target_expr=None, compute_cPCs=True, pca_components=30, cca_components=2):
         print("⚙️ Starting transformation")
         
         # --- VALIDATION BLOCK ---
@@ -275,7 +339,7 @@ class Celligner(object):
             if target_expr is not None:
                 self.target_input = self.__checkExpression(target_expr, is_reference=False)
                 self.centered_target_input = self.__meanCenter()
-
+        
                 print(f"✅ Target input shape: {self.target_input.shape}")
                 print(f"📉 Target input min: {self.target_input.min().min():.3f}, max: {self.target_input.max().max():.3f}")
 
@@ -362,35 +426,41 @@ class Celligner(object):
         )
         print(f"✅ Got {len(self.mnn_pairs)} MNN pairs")
 
-        # --- FINAL ALIGNMENT: Warp target toward unmodified reference ---
-        print("🔁 Applying warp from transformed target to original reference using MNN pairs...")
-        target_corrected, _ = mnn.marioniCorrect(
-            self.ref_input,
-            transformed_target,
-            var_index=list(range(len(self.ref_input.columns))),
-            var_subset=varsubset,
-            mnn_pairs=self.mnn_pairs,
-            **self.mnn_kwargs,
+        # --- CCA TRANSFORMATION ---
+        print("🔄 Running CCA on MNN pairs...")
+        # map MNN paris to actual indices 
+        ref_index = self.ref_input.index.to_numpy()
+        target_index = self.target_input.index.to_numpy()
+
+        X_indices = []
+        Y_indices = []
+
+        for r_pos, t_pos in self.mnn_pairs:
+            X_indices.append(ref_index[r_pos])
+            Y_indices.append(target_index[t_pos])
+        
+        X = self.ref_input.loc[X_indices, self.common_genes]
+        Y = self.target_input.loc[Y_indices, self.common_genes]
+        self.__fitCCA(X, Y, cca_components=cca_components, pca_components=pca_components)
+   
+        # Transform the data using CCA
+        print("🔄 Transforming data using CCA...")
+        _, target_transformed = self.__CCAtransform(self.ref_input, self.target_input)
+        # inverse transform target to ref space
+        target_reversed = self.cca.inverse_transform(X=target_transformed)
+        target_reversed = pd.DataFrame(
+            target_reversed, 
+            index=self.Y_reduced.index, 
+            columns=self.Y_reduced.columns
         )
 
-        # Step 1: Compute centroid of transformed_target
-        centroid = transformed_target.mean(axis=0)
+        projected_target = pd.DataFrame(self.pca_X.inverse_transform(target_reversed), index=target_reversed.index, columns=self.target_input.columns)
 
-        # Step 2: Center transformed_target around that centroid
-        centered_residual = transformed_target - centroid
+        # Combine the reference and target data
+        self.combined_output = pd.concat([self.ref_input, projected_target])
 
-        # Step 3: Add scaled centered signal back to the fully warped target
-        alpha = 0.1
-        target_corrected += alpha * centered_residual
-
-        self.combined_output = pd.concat([self.ref_input, target_corrected])
-        print(f"✅ Final combined shape: {self.combined_output.shape}")
-        del target_corrected
-        gc.collect()
-
-        print("✅ Done")
+        print("Done")
         return self
-
 
     def computeMetricsForOutput(self, umap_rand_seed=14, UMAP_only=False, model_ids=None, tumor_ids=None):
         """
