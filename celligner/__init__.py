@@ -17,7 +17,7 @@ import pandas as pd
 import numpy as np
 
 #from contrastive import CPCA
-import mnnpy
+import mnnpy.mnnpy as mnnpy
 
 
 class Celligner(object):
@@ -71,6 +71,8 @@ class Celligner(object):
         self.umap_reduced = None
         self.output_clusters = None
         self.tumor_CL_dist = None
+
+        self.features = {"ref": {}, "target": {}}
 
 
     def __checkExpression(self, expression, is_reference):
@@ -219,6 +221,7 @@ class Celligner(object):
         
         self.common_genes = list(ref_expr.columns)
         self.ref_input = self.__checkExpression(ref_expr, is_reference=True)
+        self.features["ref"]["centered"] = self.ref_input.copy()
         
         # Cluster and find differential expression for reference data
         self.ref_clusters = self.__cluster(self.ref_input)
@@ -265,6 +268,7 @@ class Celligner(object):
             if target_expr is not None:
                 
                 self.target_input = self.__checkExpression(target_expr, is_reference=False)
+                self.features["target"]["centered"] = self.target_input.copy()
 
                 # Cluster and find differential expression for target data
                 self.target_clusters = self.__cluster(self.target_input)
@@ -335,7 +339,9 @@ class Celligner(object):
                     self.de_genes = temp[temp.isin(self.ref_input.columns)].to_list()
 
             self.target_input = self.__checkExpression(target_expr, is_reference=False)
+            self.features["target"]["centered"] = self.target_input.copy()
             transformed_ref = self.ref_input
+            self.features["ref"]["transformed"] = transformed_ref.copy()
         
         # Only need to regress out of target dataset if using previously computed cPCs
         print("Regressing top cPCs out of target dataset..")
@@ -345,6 +351,7 @@ class Celligner(object):
                 .predict(self.cpca_loadings.T)
                 .T
         )
+        self.features["target"]["transformed"] = transformed_target.copy()
 
         # Do MNN 
         print("Doing the MNN analysis using Marioni et al. method..")
@@ -357,6 +364,9 @@ class Celligner(object):
             var_subset=varsubset,
             **self.mnn_kwargs,
         )
+
+        self.features["target"]["corrected"] = target_corrected.copy()
+        self.features["ref"]["corrected"] = transformed_ref.copy()
 
         if compute_cPCs:
             self.combined_output =  pd.concat([target_corrected, transformed_ref])
