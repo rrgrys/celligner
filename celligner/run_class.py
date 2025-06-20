@@ -378,7 +378,7 @@ class Celligner(object):
         for ref_pos, target_pos in self.mnn_pairs:
             mnn_dict[target_pos].append(ref_pos)
 
-        residual_addback = pd.DataFrame(0, index=target_index, columns=transformed_target.columns)
+        residual_addback = pd.DataFrame(0.0, index=target_index, columns=transformed_target.columns)
 
         for t_pos, r_pos_list in mnn_dict.items():
             if not r_pos_list:
