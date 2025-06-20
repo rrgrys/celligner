@@ -220,8 +220,8 @@ class Celligner(object):
         """
         
         self.common_genes = list(ref_expr.columns)
-        self.ref_input = self.__checkExpression(ref_expr, is_reference=True)
-        #self.ref_input = ref_expr
+        # self.ref_input = self.__checkExpression(ref_expr, is_reference=True)
+        self.ref_input = ref_expr
         self.features["ref"]["centered"] = self.ref_input.copy()
         
         # Cluster and find differential expression for reference data
@@ -268,8 +268,8 @@ class Celligner(object):
             
             if target_expr is not None:
                 
-                self.target_input = self.__checkExpression(target_expr, is_reference=False)
-                # self.target_input = target_expr
+                # self.target_input = self.__checkExpression(target_expr, is_reference=False)
+                self.target_input = target_expr
                 self.features["target"]["centered"] = self.target_input.copy()
 
                 # Cluster and find differential expression for target data
@@ -341,8 +341,8 @@ class Celligner(object):
                     temp = pd.Series(self.de_genes)
                     self.de_genes = temp[temp.isin(self.ref_input.columns)].to_list()
 
-            self.target_input = self.__checkExpression(target_expr, is_reference=False)
-            # self.target_input = target_expr
+            # self.target_input = self.__checkExpression(target_expr, is_reference=False)
+            self.target_input = target_expr
             self.features["target"]["centered"] = self.target_input.copy()
             transformed_ref = self.ref_input
             self.features["ref"]["transformed"] = transformed_ref.copy()
