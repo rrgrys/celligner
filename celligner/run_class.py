@@ -17,7 +17,7 @@ import pandas as pd
 import numpy as np
 
 #from contrastive import CPCA
-from mnnpy import mnn
+from mnnpy.mnnpy import mnn
 
 class Celligner(object):
     def __init__(
