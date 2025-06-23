@@ -18,7 +18,7 @@ import numpy as np
 from collections import defaultdict
 
 #from contrastive import CPCA
-from mnnpy import mnn
+from mnnpy.mnnpy import mnn
 
 import matplotlib.pyplot as plt
 
