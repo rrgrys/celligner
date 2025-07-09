@@ -373,15 +373,15 @@ class Celligner(object):
             **self.mnn_kwargs,
         )
 
-        # Step 1: Compute centroid of transformed_target
-        centroid = transformed_target.mean(axis=0)
+        # # Step 1: Compute centroid of transformed_target
+        # centroid = transformed_target.mean(axis=0)
 
-        # Step 2: Center transformed_target around that centroid
-        centered_residual = transformed_target - centroid
+        # # Step 2: Center transformed_target around that centroid
+        # centered_residual = transformed_target - centroid
 
-        # Step 3: Add scaled centered signal back to the fully warped target
-        alpha = 0.1
-        target_corrected += alpha * centered_residual
+        # # Step 3: Add scaled centered signal back to the fully warped target
+        # alpha = 0.1
+        # target_corrected += alpha * centered_residual
 
         self.combined_output = pd.concat([self.ref_input, target_corrected])
         print(f"✅ Final combined shape: {self.combined_output.shape}")
