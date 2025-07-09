@@ -227,7 +227,27 @@ class Celligner(object):
         
         pca.fit(foreground_cov - background_cov)
         return pca.components_, pca.explained_variance_
+    
+    def __get_hvg_percentiles(self, expr_df, percentiles=[10, 20, 35, 50, 80]):
+        """
+        Extract top N% most variable genes from the expression DataFrame.
 
+        Args:
+            expr_df (pd.DataFrame): Expression matrix [samples x genes]
+            percentiles (list): Percentages of top variable genes to extract
+
+        Returns:
+            dict: {percent: list of genes} for each cutoff
+        """
+        gene_variances = expr_df.var(axis=0)
+        sorted_genes = gene_variances.sort_values(ascending=False)
+
+        hvg_sets = {}
+        for p in percentiles:
+            top_n = int(len(sorted_genes) * (p / 100))
+            hvg_sets[p] = sorted_genes.iloc[:top_n].index.tolist()
+
+        return hvg_sets
 
     def fit(self, ref_expr):
         """
@@ -345,43 +365,42 @@ class Celligner(object):
             .predict(self.cpca_loadings.T).T
         transformed_target = self.target_input - regression_target
 
-        print(f"🔍 Check regression result stats:")
-        print(f" - ref residuals max: {regression_ref.max().max():.2f}, min: {regression_ref.min().min():.2f}")
-        print(f" - target residuals max: {regression_target.max():.2f}, min: {regression_target.min():.2f}")
-        print(f" - transformed target max: {transformed_target.max().max():.2f}, min: {transformed_target.min().min():.2f}")
+        # Combine residuals from both domains
+        residual_concat = pd.concat([transformed_ref, transformed_target])
+        # Extract HVGs
+        hvg_subsets = self.__get_hvg_percentiles(residual_concat, percentiles=[10, 20, 35, 50, 80])
 
-        # --- MNN ANALYSIS IN REGRESSED SPACE ---
-        print("🔗 Running MNN correction in regressed-out space...")
-        varsubset = np.array([1 if g in self.de_genes else 0 for g in self.centered_target_input.columns]).astype(bool)
-        _, self.mnn_pairs = mnn.marioniCorrect(
-            transformed_ref,
-            transformed_target,
-            var_index=list(range(len(self.ref_input.columns))),
-            var_subset=varsubset,
-            **self.mnn_kwargs,
+        target_current = transformed_target.copy()
+
+        for p, hvg_genes in hvg_subsets.items():
+            print(f"🔍 Running MNN correction on {p}% HVGs")
+            # Select HVGs
+            varsubset = np.array([1 if g in hvg_genes else 0 for g in transformed_ref.columns]).astype(bool)
+            # Run MNN correction
+            _, mnn_pairs = mnn.marioniCorrect(
+                transformed_ref,
+                transformed_target,
+                var_index=list(range(len(transformed_ref.columns))),
+                var_subset=varsubset,
+                **self.mnn_kwargs,
+            )
+
+            print(f"✅ Got {len(mnn_pairs)} MNN pairs for {p}% HVGs")
+            # Apply warp to target
+            target_current, _ = mnn.marioniCorrect(
+                self.ref_input,
+                target_current,
+                var_index=list(range(len(transformed_ref.columns))),
+                var_subset=varsubset,
+                mnn_pairs=mnn_pairs,
+                **self.mnn_kwargs,
+            )
+
+        target_corrected = pd.DataFrame(
+            target_current,
+            index=self.target_input.index,
+            columns=self.target_input.columns
         )
-        print(f"✅ Got {len(self.mnn_pairs)} MNN pairs")
-
-        # --- FINAL ALIGNMENT: Warp target toward unmodified reference ---
-        print("🔁 Applying warp from transformed target to original reference using MNN pairs...")
-        target_corrected, _ = mnn.marioniCorrect(
-            self.ref_input,
-            transformed_target,
-            var_index=list(range(len(self.ref_input.columns))),
-            var_subset=varsubset,
-            mnn_pairs=self.mnn_pairs,
-            **self.mnn_kwargs,
-        )
-
-        # Step 1: Compute centroid of transformed_target
-        centroid = transformed_target.mean(axis=0)
-
-        # Step 2: Center transformed_target around that centroid
-        centered_residual = transformed_target - centroid
-
-        # Step 3: Add scaled centered signal back to the fully warped target
-        alpha = 0.1
-        target_corrected += alpha * centered_residual
 
         self.combined_output = pd.concat([self.ref_input, target_corrected])
         print(f"✅ Final combined shape: {self.combined_output.shape}")
