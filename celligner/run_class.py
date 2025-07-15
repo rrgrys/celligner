@@ -368,15 +368,26 @@ class Celligner(object):
         # Combine residuals from both domains
         residual_concat = pd.concat([transformed_ref, transformed_target])
         # Extract HVGs
-        hvg_subsets = self.__get_hvg_percentiles(residual_concat, percentiles=[10, 20, 35, 50, 80])
+        from collections import Counter
 
-        target_current = transformed_target.copy()
+        # Step 1: Compute HVG subsets
+        hvg_subsets = self.__get_hvg_percentiles(residual_concat, percentiles=[5, 10, 20, 30])
+        pair_counter = Counter()
 
+        percentile_weights = {
+        5: 5,   # most important
+        10: 3,
+        20: 2,
+        30: 1   # least important   
+        }
+
+        # Step 2: Collect MNN pairs across percentiles
         for p, hvg_genes in hvg_subsets.items():
-            print(f"🔍 Running MNN correction on {p}% HVGs")
-            # Select HVGs
-            varsubset = np.array([1 if g in hvg_genes else 0 for g in transformed_ref.columns]).astype(bool)
-            # Run MNN correction
+            print(f"🔍 Running MNN detection on {p}% HVGs")
+            weight = percentile_weights[p]
+            
+            varsubset = np.array([g in hvg_genes for g in transformed_ref.columns])
+            
             _, mnn_pairs = mnn.marioniCorrect(
                 transformed_ref,
                 transformed_target,
@@ -384,23 +395,38 @@ class Celligner(object):
                 var_subset=varsubset,
                 **self.mnn_kwargs,
             )
-
+            
             print(f"✅ Got {len(mnn_pairs)} MNN pairs for {p}% HVGs")
-            # Apply warp to target
-            target_current, _ = mnn.marioniCorrect(
-                self.ref_input,
-                target_current,
-                var_index=list(range(len(transformed_ref.columns))),
-                var_subset=varsubset,
-                mnn_pairs=mnn_pairs,
-                **self.mnn_kwargs,
-            )
 
+            for pair in mnn_pairs:
+                pair_counter[tuple(pair)] += weight
+
+        # Step 3: Build weighted list of MNN pairs (duplicate by count)
+        weighted_mnn_pairs = []
+        for pair, count in pair_counter.items():
+            weighted_mnn_pairs.extend([pair] * count)
+
+        print(f"🔁 Final MNN pairs after weighting: {len(weighted_mnn_pairs)} (unique: {len(pair_counter)})")
+
+        # Step 4: Apply one-pass correction using combined pairs
+        varsubset_all = np.array([g in set().union(*hvg_subsets.values()) for g in transformed_ref.columns])
+
+        target_current, _ = mnn.marioniCorrect(
+            self.ref_input,
+            transformed_target,
+            var_index=list(range(len(transformed_ref.columns))),
+            var_subset=varsubset_all,
+            mnn_pairs=weighted_mnn_pairs,
+            **self.mnn_kwargs,
+        )
+
+        # Step 5: Wrap up
         target_corrected = pd.DataFrame(
             target_current,
             index=self.target_input.index,
             columns=self.target_input.columns
         )
+
 
         self.combined_output = pd.concat([self.ref_input, target_corrected])
         print(f"✅ Final combined shape: {self.combined_output.shape}")
