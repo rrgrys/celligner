@@ -17,7 +17,7 @@ import pandas as pd
 import numpy as np
 
 #from contrastive import CPCA
-import mnnpy
+from mnnpy.mnnpy.mnn import marioniCorrect
 
 
 class Celligner(object):
@@ -350,7 +350,7 @@ class Celligner(object):
         print("Doing the MNN analysis using Marioni et al. method..")
         # Use top DE genes only
         varsubset = np.array([1 if i in self.de_genes else 0 for i in self.target_input.columns]).astype(bool)
-        target_corrected, self.mnn_pairs = mnnpy.marioniCorrect(
+        target_corrected, self.mnn_pairs = marioniCorrect(
             transformed_ref,
             transformed_target,
             var_index=list(range(len(self.ref_input.columns))),
